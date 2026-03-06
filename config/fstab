@@ -1,0 +1,27 @@
+# Static information about the filesystems.
+# See fstab(5) for details.
+
+# <file system> <dir> <type> <options> <dump> <pass>
+# /dev/mapper/cryptroot LABEL=ARCHROOT
+UUID=UUID_LUKS2 / btrfs rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvol=/@ 0 0
+
+# /dev/mapper/cryptroot LABEL=ARCHROOT
+UUID=UUID_LUKS2 /.snapshots btrfs rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvol=/@snapshots 0 0
+
+# /dev/nvme0n1p1 LABEL=EFI
+UUID=UUID_EFI /boot vfat rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro 0 2
+
+# /dev/mapper/cryptroot LABEL=ARCHROOT
+UUID=UUID_LUKS2 /home btrfs rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvol=/@home 0 0
+
+# /dev/mapper/cryptroot LABEL=ARCHROOT
+UUID=UUID_LUKS2 /var/log btrfs rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvol=/@var-log 0 0
+
+# /dev/mapper/cryptroot LABEL=ARCHROOT
+UUID=UUID_LUKS2 /var/cache btrfs rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvol=/@var-cache 0 0
+
+# /dev/mapper/cryptroot LABEL=ARCHROOT
+UUID=UUID_LUKS2 /var/tmp btrfs rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvol=/@var-tmp 0 0
+
+# /dev/mapper/cryptroot LABEL=ARCHROOT
+UUID=UUID_LUKS2 /var/lib/docker btrfs rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvol=/@docker 0 0
