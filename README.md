@@ -1,121 +1,148 @@
 # Arch Linux — ASUS Vivobook X1504VA
 
-Documentation of a completed Arch Linux installation before migration to Fedora Silverblue.
-This is a reference archive, not a dotfiles repo for reuse.
+A documented Arch Linux installation where every technical decision has a recorded rationale.
+
+This is not a dotfiles collection or an install guide. It is an engineering reference: full disk encryption, Btrfs snapshots, Wayland compositing, and kernel driver configuration on a 13th Gen Intel laptop — with the reasoning behind each choice preserved for future reference.
+
+> **Note:** This system has since been migrated to Fedora Silverblue. The repository is maintained as an archive of the decisions and configurations described below.
+
+---
+
+## Key Decisions
+
+Five non-obvious problems came up during this build. Each one required understanding something deeper than the surface-level fix.
+
+### 1. LUKS2 with argon2id, not PBKDF2
+
+The default LUKS2 key derivation function is PBKDF2. It is CPU-bound, which means its calibrated cost on the target hardware has no bearing on the cost an attacker pays using a GPU cluster. A modern GPU evaluates PBKDF2 guesses at rates that dwarf what a laptop calibrates for "2 seconds of work."
+
+argon2id is memory-hard. Each evaluation requires a large RAM allocation, and a GPU with thousands of cores cannot run thousands of simultaneous argon2id evaluations without thousands of simultaneous large memory windows — which it does not have. The parallelism advantage collapses.
+
+One command, one flag: `cryptsetup luksConvertKey --pbkdf argon2id /dev/nvme0n1p2`. The unlock time increases by a fraction of a second. The brute-force resistance increases by orders of magnitude.
+
+TRIM passthrough (`discard=async` in fstab, `rd.luks.options=discard` in the kernel cmdline) was deliberately enabled, trading minor metadata leakage for SSD health and write performance. On a laptop with no deniability requirement, this is the correct trade-off.
+
+### 2. Seven Btrfs subvolumes, not one
+
+Most guides create `@` and `@home`. That is the minimum. It is not enough.
+
+Layout: `@`, `@home`, `@snapshots`, `@var-log`, `@var-cache`, `@var-tmp`, `@docker`.
+
+A Btrfs snapshot captures the entire state of its target subvolume. If Docker image layers, package caches, log files, and temporary data all live inside `@`, every system snapshot drags that along. Snapshots become bloated, diffs become meaningless, and rollbacks become unpredictable.
+
+The isolation logic:
+
+- `@snapshots` must be its own subvolume. Without it, Snapper recurses into itself — the snapshot directory appears inside the snapshot it is creating.
+- `@docker` must be isolated. Docker's write-heavy layer churn would otherwise be captured in every pre/post package operation snapshot.
+- `@var-log`, `@var-cache`, and `@var-tmp` contain data that is either regenerable or intentionally ephemeral. None of it should contribute to OS snapshot deltas.
+- `@home` enables independent rollback: reverting root after a broken update does not discard in-progress work in the home directory.
+
+The extra fstab entries cost nothing. The snapshot quality difference is significant.
+
+### 3. systemd-boot, not GRUB
+
+On a pure UEFI system with one OS and one kernel, GRUB's power is entirely wasted. Its configuration language, module loading system, theme engine, and `grub-mkconfig` tooling are complexity without benefit.
+
+systemd-boot is an EFI application that reads `.conf` files from the ESP and passes parameters to the kernel. The entire boot configuration for this machine is five lines:
+
+```
+default arch.conf
+timeout 3
+console-mode max
+editor no
+```
+
+Updates happen via `bootctl update`, which integrates with pacman hooks. The bootloader is auditable at a glance. GRUB has had multiple high-profile CVEs (BootHole and its follow-ons) that trace directly to its complexity. Reducing attack surface in the component that runs before any OS-level security is active is a practical benefit, not a theoretical one.
+
+### 4. Intel Xe driver: two kernel parameters, not one
+
+The Raptor Lake-P GPU (PCI device ID `a7a1`) is supported by the newer `xe` driver, not the legacy `i915`. The documented parameter to enable it is `xe.force_probe=a7a1`. Setting only that parameter does nothing.
+
+`i915` loads first during the kernel's device probe phase. It claims `a7a1` because the device ID exists in its table. By the time `xe` attempts to bind, the GPU is already owned. `xe.force_probe` has nothing to probe.
+
+The fix is a second parameter: `i915.force_probe=!a7a1`. The `!` prefix is a per-device exclusion directive. It tells `i915` to skip this specific device ID during its probe loop. Now `xe` can bind.
+
+Both parameters must appear together in the kernel command line:
+
+```
+i915.force_probe=!a7a1 xe.force_probe=a7a1
+```
+
+Either one alone does not work. This is a case where understanding Linux kernel driver binding order matters more than knowing which driver to use.
+
+### 5. Docker overlay2 on Btrfs: explicit config is not enough
+
+Docker detects the underlying filesystem and historically selects the `btrfs` storage driver when it finds Btrfs. The `btrfs` driver is slower and less maintained than overlay2.
+
+Setting `"storage-driver": "overlay2"` in `/etc/docker/daemon.json` is the obvious fix. It is not sufficient by itself — Docker may warn or override depending on the kernel and Docker versions.
+
+The complete fix: `/var/lib/docker` is mounted from its own Btrfs subvolume (`@docker`), and overlay2 is explicitly declared in `daemon.json`. Docker's directory sits on Btrfs at the VFS level, but overlay2 constructs its own internal structure without conflicting with Btrfs snapshot mechanics.
+
+Log rotation was configured at the same time. The default Docker log configuration has no size limit. On a system where `/var/log` is a bounded subvolume, unbounded container logs will eventually fill it. `"max-size": "10m"` and `"max-file": "3"` caps this at 30 MB per container.
+
+---
+
+## Snapper: why the order of operations matters
+
+Snapper requires the `@snapshots` subvolume to exist and be mounted at `/.snapshots` before creating its root configuration. Running `snapper -c root create-config /` without the subvolume in place causes Snapper to create a plain `.snapshots` directory inside `@`. This defeats the isolation goal: snapshots end up nested inside root snapshots, and the fstab entry conflicts with what Snapper created.
+
+The correct sequence:
+
+1. Create the `@snapshots` subvolume manually
+2. Add the mount entry to `/etc/fstab`
+3. Mount it at `/.snapshots`
+4. Run `snapper -c root create-config /`
+
+If `create-config` has already been run without the subvolume, recovery requires removing the directory Snapper created, creating the subvolume, mounting it, and re-running `create-config`. This sequence is not obvious from the documentation.
 
 ---
 
 ## Hardware
 
-| Component | Value |
-|-----------|-------|
+| Component | Specification |
+|-----------|---------------|
 | Model | ASUS Vivobook X1504VA |
 | CPU | Intel Core i5-1334U (13th Gen, Raptor Lake-P) |
-| GPU | Intel Iris Xe Graphics (PCI ID: a7a1) |
+| GPU | Intel Iris Xe Graphics (PCI ID: `a7a1`) |
 | RAM | 16 GB |
 | Storage | 476.9 GB NVMe SSD |
-| Keyboard | ABNT2 (Brazilian Portuguese layout) |
-| Network | Intel Wi-Fi 6 (iwlwifi) |
-
----
+| Keyboard | ABNT2 (Brazilian Portuguese) |
+| Network | Intel Wi-Fi 6 (`iwlwifi`) |
 
 ## Stack
 
-| Component | Choice | Why |
-|-----------|--------|-----|
-| OS | Arch Linux | Rolling release, full control over every layer |
-| Filesystem | Btrfs | Native snapshots, transparent compression, subvolume layout |
+| Layer | Choice | Rationale |
+|-------|--------|-----------|
+| Filesystem | Btrfs | Native snapshots, transparent compression, subvolume isolation |
 | Encryption | LUKS2 + argon2id | Memory-hard KDF, resistant to GPU/ASIC brute-force |
-| Bootloader | systemd-boot | Simple EFI-native loader, no GRUB complexity |
-| Initramfs | mkinitcpio + systemd hooks | sd-encrypt hook integrates cleanly with LUKS2 |
-| GPU Driver | Intel Xe (xe.force_probe) | Required for Raptor Lake-P Xe GPU; i915 blocked per-device |
+| Bootloader | systemd-boot | Minimal EFI-native loader, no GRUB complexity |
+| Initramfs | mkinitcpio + systemd hooks | `sd-encrypt` integrates cleanly with LUKS2 |
+| GPU driver | Intel Xe (`xe.force_probe`) | Required for Raptor Lake-P; `i915` blocked per-device |
 | Snapshots | Snapper | Automated pre/post pairs, timeline cleanup, Btrfs-native |
-| Firewall | nftables | Native kernel netfilter, stateless ruleset |
-| Containers | Docker (overlay2 on Btrfs) | Standard tooling; overlay2 forced over btrfs driver |
-| Display | Wayland / Hyprland | Wayland-native compositor, tiling WM |
-| Terminal | Kitty | GPU-accelerated, good Wayland support |
-| Bar | Waybar | Modular status bar for Hyprland |
-| Launcher | rofi | Fast application launcher |
-| Audio | PipeWire + WirePlumber | Modern audio graph, low-latency |
-
----
-
-## Key Technical Decisions
-
-### LUKS2 with argon2id over default settings
-
-The default LUKS2 format uses PBKDF2 as the key derivation function. PBKDF2 is purely CPU-bound: its cost is measured in iterations per second on a single core, which means an attacker with access to GPU clusters or ASICs can evaluate guesses at rates orders of magnitude faster than what the target hardware uses for calibration. The extra hardware the attacker brings is directly leveraged against the passphrase.
-
-argon2id is memory-hard. It requires a configurable amount of RAM during key derivation, which breaks the parallelism advantage of GPU attacks. A GPU with thousands of cores cannot run thousands of simultaneous argon2id evaluations unless it has thousands of simultaneous large memory allocations—which it doesn't. The practical effect is that the attacker's hardware advantage collapses: a high-memory, low-parallelism operation is much harder to scale than a low-memory, high-parallelism one.
-
-The TRIM passthrough options (`discard=async` in fstab, `rd.luks.options=discard` in the kernel cmdline) were deliberately enabled, trading minor metadata leakage (an attacker can observe which sectors are in use) for SSD health and write performance on the NVMe device. On a laptop with no threat model requiring deniability of data presence, this is the right call.
-
----
-
-### Btrfs subvolume layout (7 subvolumes)
-
-The installation uses 7 Btrfs subvolumes: `@` (root), `@home`, `@snapshots`, `@var-log`, `@var-cache`, `@var-tmp`, and `@docker`. The motivation is containment: a Btrfs snapshot captures the entire state of the subvolume it targets. If everything lives in a single subvolume, snapshots capture ephemeral and volatile data—package caches, Docker image layers, log files, temp files—alongside the actual system state. This makes snapshots bloated, diffs noisy, and rollbacks unpredictable.
-
-Separating `@home` from `@` enables independent rollback vectors: rolling back root after a broken update does not discard in-progress home directory changes. `@snapshots` must be its own subvolume to prevent the snapshot directory from appearing inside root snapshots, which would be recursive and breaks Snapper's logic. `@docker` isolation means Docker's write-heavy layer churn never enters system snapshots at all—Docker manages its own state and does not benefit from being snapshot with the OS.
-
-`@var-log`, `@var-cache`, and `@var-tmp` are separated because they contain data that is either intentionally ephemeral, actively rotated, or regenerable—none of which should contribute to OS snapshot deltas. The key insight is that Btrfs subvolumes are the right primitive for this kind of isolation, not bind mounts or directory structure alone.
-
----
-
-### systemd-boot over GRUB
-
-GRUB is the default recommendation in much of the Arch documentation, but on a pure UEFI system with no legacy boot requirement, it introduces significant unnecessary complexity: its own configuration language (`grub.cfg`), `grub-mkconfig` tooling, module loading system, theme engine, and a non-trivial maintenance surface. systemd-boot is a trivially simple EFI application: it reads `.conf` files from the ESP, passes kernel parameters, and exits. The entire boot configuration for this system is 5 lines of plaintext.
-
-The practical argument: GRUB's flexibility is completely wasted here. There is one OS, one kernel, one set of boot parameters. systemd-boot handles this without any abstraction layer between the config file and what the kernel receives. Updates integrate cleanly via `bootctl update` and the `systemd-boot-update.service` unit, which can be triggered automatically by pacman hooks. GRUB also has a history of high-profile CVEs related to its complexity (BootHole and follow-on vulnerabilities); reducing bootloader complexity reduces attack surface in a component that runs before any OS-level security is active.
-
----
-
-### Intel Xe driver with force_probe (and why i915 must be blocked)
-
-The Intel Raptor Lake-P GPU (PCI device ID `a7a1`) sits in a transitional position in the Linux driver ecosystem. The `i915` driver is the longstanding Intel GPU driver and will claim this device ID by default at kernel module load time. However, `i915` does not fully support the Xe microarchitecture, resulting in suboptimal performance and potential instability. The newer `xe` driver correctly handles the hardware but is gated behind `xe.force_probe=a7a1` because the device ID had not yet been promoted to stable support in the `xe` driver at setup time.
-
-The critical, non-obvious detail is `i915.force_probe=!a7a1`: the `!` prefix is a per-device blacklist directive. Without it, `i915` loads first (kernel driver priority), claims the GPU, and `xe` never binds—even if `xe` is present and `xe.force_probe` is set. Both parameters must appear together in the kernel command line. Setting only `xe.force_probe=a7a1` without the `i915` exclusion results in `i915` still owning the device and `xe` having nothing to bind to. This is a case where understanding Linux kernel driver binding order matters more than knowing which driver to use.
-
----
-
-### Docker overlay2 on Btrfs (the conflict and the fix)
-
-Docker has a known storage driver conflict with Btrfs. When Docker detects Btrfs as the underlying filesystem for its data directory, it historically selects the `btrfs` storage driver automatically. The `btrfs` driver is slow, poorly maintained, and lacks the overlay2 feature set. Even when `"storage-driver": "overlay2"` is set in `daemon.json`, Docker performs a filesystem-type check at startup and may override or warn against the configuration.
-
-The fix used here is a combination: Docker's data directory (`/var/lib/docker`) is mounted from its own Btrfs subvolume (`@docker`), and `overlay2` is explicitly declared in `/etc/docker/daemon.json`. The subvolume mount means Docker's directory is on Btrfs at the VFS level, but overlay2 constructs its own directory structure (`overlay2/`, `image/`, `volumes/`) inside that mount without conflicting with Btrfs's own snapshot mechanics. Log rotation (`max-size: 10m`, `max-file: 3`) was configured at the same time—the default is no rotation, which on a system with a bounded `/var/log` subvolume and no automatic log pruning is a slow disk exhaustion waiting to happen.
-
----
-
-### Snapper setup sequence (why the order of operations matters)
-
-Snapper requires the `@snapshots` subvolume to exist and be mounted at `/.snapshots` before it creates its root configuration. If you run `snapper -c root create-config /` before manually creating the subvolume and adding the fstab entry, Snapper creates a `.snapshots` directory inside the `@` subvolume as a plain directory. This defeats the isolation goal entirely: snapshots end up nested inside root snapshots, and the `/.snapshots` fstab entry conflicts with what Snapper created, resulting in mount errors or boot failures depending on timing.
-
-The correct sequence: (1) create the `@snapshots` Btrfs subvolume manually on the unmounted or live filesystem, (2) add the mount entry to `/etc/fstab`, (3) mount it at `/.snapshots`, (4) then run `snapper -c root create-config /`. Snapper detects the existing mountpoint and uses it correctly. If you have already run `create-config` without the subvolume, recovery requires: removing the `.snapshots` directory Snapper created, creating the subvolume, adding and mounting the fstab entry, and re-running `create-config`. Discovering this after the first snapshot cycle, when Snapper has already written into the wrong location, makes the recovery more involved.
-
-The snapper config enables timeline snapshots (hourly, daily), pre/post pairs for package operations via the `snap-pac` package, and cleanup rules to bound snapshot count. The `ALLOW_GROUPS="wheel"` setting allows non-root users in the wheel group to manage snapshots.
-
----
+| Firewall | nftables | Kernel-native netfilter, stateless ruleset |
+| Containers | Docker (overlay2 on Btrfs) | overlay2 forced over btrfs driver via `daemon.json` |
+| Display | Wayland / Hyprland | Wayland-native tiling compositor |
+| Terminal | Kitty | GPU-accelerated, Wayland-native |
+| Audio | PipeWire + WirePlumber | Modern audio graph, low-latency routing |
 
 ## What I Would Do Differently
 
-- **Script the installation end-to-end.** Documenting after the fact reveals how many decisions were made in an undocumented order. A reproducible install script forces you to make sequencing explicit, catches ordering bugs, and produces documentation as a byproduct.
-- **Use a detached LUKS header.** Storing the LUKS header on a separate USB device means the encrypted partition is not even recognizable as LUKS without the header device present. The threat model here didn't require it, but the hardware supports it and the cost is low.
-- **Configure snapper-rollback before needing it.** Setting up the rollback mechanism (bootloader entries for snapshot boots) should happen during installation, not after the first botched update.
-- **Evaluate ext4 for `/var/lib/docker`.** The overlay2/Btrfs interaction works but requires ongoing awareness. A dedicated ext4 partition or loop device for Docker's data directory would eliminate the friction entirely.
-- **Test the `xe` driver situation earlier.** The `i915.force_probe=!a7a1` + `xe.force_probe=a7a1` combination took debugging time to arrive at. Running hardware validation immediately post-install rather than assuming the GPU was working would have surfaced this sooner.
-
----
+- **Script the installation end-to-end.** Documenting after the fact reveals how many decisions were made in an undocumented order. A reproducible install script forces sequencing to be explicit and produces documentation as a byproduct.
+- **Use a detached LUKS header.** Storing the header on a separate device means the encrypted partition is not recognizable as LUKS without it. The threat model here did not require it, but the cost is low.
+- **Configure snapper-rollback before needing it.** Setting up bootloader entries for snapshot boots should happen during installation, not after the first broken update.
+- **Evaluate ext4 for `/var/lib/docker`.** The overlay2/Btrfs interaction works but requires ongoing awareness. A dedicated ext4 partition for Docker's data directory would eliminate the friction entirely.
+- **Validate GPU driver binding immediately post-install.** `lspci -k` takes five seconds and would have surfaced the `i915`/`xe` conflict before it became a debugging session.
 
 ## Reference Configs
 
-| File | Path in this repo |
-|------|------------------|
-| systemd-boot entry | [config/arch.conf](config/arch.conf) |
-| systemd-boot loader | [config/loader.conf](config/loader.conf) |
-| mkinitcpio | [config/mkinitcpio.conf](config/mkinitcpio.conf) |
-| fstab | [config/fstab](config/fstab) |
-| nftables firewall | [config/nftables.conf](config/nftables.conf) |
-| Docker daemon | [config/docker-daemon.json](config/docker-daemon.json) |
-| Snapper root config | [config/snapper-root.conf](config/snapper-root.conf) |
-| Hyprland | [config/hyprland.conf](config/hyprland.conf) |
-| Explicit package list | [config/pkglist.txt](config/pkglist.txt) |
+| File | Path |
+|------|------|
+| systemd-boot entry | [`config/arch.conf`](config/arch.conf) |
+| systemd-boot loader | [`config/loader.conf`](config/loader.conf) |
+| mkinitcpio | [`config/mkinitcpio.conf`](config/mkinitcpio.conf) |
+| fstab | [`config/fstab`](config/fstab) |
+| nftables firewall | [`config/nftables.conf`](config/nftables.conf) |
+| Docker daemon | [`config/docker-daemon.json`](config/docker-daemon.json) |
+| Snapper root config | [`config/snapper-root.conf`](config/snapper-root.conf) |
+| Hyprland | [`config/hyprland.conf`](config/hyprland.conf) |
+| Package list | [`config/pkglist.txt`](config/pkglist.txt) |
